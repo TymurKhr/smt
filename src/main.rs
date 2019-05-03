@@ -6,15 +6,16 @@ use rustc_serialize::hex::ToHex;
 use smt::cache::CacheBranch;
 use std::collections::HashMap;
 
-fn sadapter(algorithm: &'static digest::Algorithm) -> Box<Fn(&Vec<u8>)->Vec<u8>>{
+fn digest_adapter(algorithm: &'static digest::Algorithm) -> Box<Fn(&Vec<u8>)->Vec<u8>>{
     let closure = move |x:&Vec<u8>|  digest::digest(algorithm, x.as_slice()).as_ref().to_vec();
     return Box::new(closure);
 }
+
 fn main() {
-    let smt = SMT::new(vec![0x42 as u8], sadapter(&digest::SHA256));
+    let smt = SMT::new(vec![0x42 as u8], digest_adapter(&digest::SHA256));
     let mut key: Vec<Vec<u8>>= Vec::new();
-    key.push((*sadapter(&digest::SHA256))(&"abc".as_bytes().to_vec()));
-    key.push((*sadapter(&digest::SHA256))(&"bcde".as_bytes().to_vec()));
+    key.push((*digest_adapter(&digest::SHA256))(&"abc".as_bytes().to_vec()));
+    key.push((*digest_adapter(&digest::SHA256))(&"bcde".as_bytes().to_vec()));
 
     let keys = Key::from_vec(key.clone());
     let d = D::from_vec(key.clone());
@@ -23,12 +24,12 @@ fn main() {
     let root_hash = smt.root_hash(&d, &c);
     assert_eq!(update_hash, root_hash);
 
-    let mut t_key: Vec<u8> =(*sadapter(&digest::SHA256))(&"not_member".as_bytes().to_vec()) ;
+    let mut t_key: Vec<u8> =(*digest_adapter(&digest::SHA256))(&"not_member".as_bytes().to_vec()) ;
     let ap = smt.audit_path(&d,  &t_key, &c);
     assert_eq!(smt.verify_audit_path(&ap, &t_key, &EMPTY.to_vec(), &root_hash), true);
     assert_eq!(smt.verify_audit_path(&ap, &t_key, &SET.to_vec(), &root_hash), false);
 
-    t_key = (*sadapter(&digest::SHA256))(&"abc".as_bytes().to_vec());
+    t_key = (*digest_adapter(&digest::SHA256))(&"abc".as_bytes().to_vec());
     let ap = smt.audit_path(&d, &t_key, &c);
     assert_eq!(smt.verify_audit_path(&ap, &t_key, &EMPTY.to_vec(), &root_hash), false);
     assert_eq!(smt.verify_audit_path(&ap, &t_key, &SET.to_vec(), &root_hash), true);

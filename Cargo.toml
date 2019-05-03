@@ -7,3 +7,4 @@ edition = "2018"
 [dependencies]
 ring = "0.14.6"
 byteorder = "1"
+rustc-serialize = "0.3"

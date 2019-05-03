@@ -1,9 +1,10 @@
 use crate::cache::Cache;
 use byteorder::{BigEndian, WriteBytesExt};
 use crate::utils::{*};
+use crate::cache::CacheNothing;
 
-const EMPTY: [u8; 1] = [0];
-const SET: [u8; 1] = [1];
+pub const EMPTY: [u8; 1] = [0];
+pub const SET: [u8; 1] = [1];
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Key {
@@ -11,7 +12,7 @@ pub struct Key {
 }
 
 impl Key {
-    fn from_vec(keys: Vec<Vec<u8>>) -> Key {
+    pub fn from_vec(keys: Vec<Vec<u8>>) -> Key {
         let mut to_return = Key { keys };
         to_return.sort();
         to_return
@@ -29,7 +30,7 @@ impl Key {
             Err(n) => n,
         };
         let (left, right) = self.keys.split_at(index);
-        return (Key::from_vec(left.to_vec()), Key::from_vec(right.to_vec()));
+        return (Key::from_vec_sorted(left.to_vec()), Key::from_vec_sorted(right.to_vec()));
     }
 }
 
@@ -61,31 +62,89 @@ impl D {
     }
 }
 
-pub struct SMT<'a, C: Cache> {
+pub struct SMT {
     c: Vec<u8>,
-    base: Vec<u8>,
-    n: u64,
+    pub base: Vec<u8>,
+    pub n: u64,
     default_hashes: Vec<Vec<u8>>,
-    hash: fn(&Vec<u8>) -> Vec<u8>,
-    cache: &'a mut C,
+    hash: Box<Fn(&Vec<u8>) -> Vec<u8>>,
 }
 
-impl<'a, C: Cache> SMT<'a, C> {
-    fn leaf_hash(&self, a: &Vec<u8>, base: &Vec<u8>) -> Vec<u8> {
-        return _leaf_hash(self.hash, &self.c, a, base);
+impl SMT {
+    pub fn new(c: Vec<u8>, hash: Box<Fn(&Vec<u8>) -> Vec<u8>>) -> SMT {
+        let n = ((*hash)(&Vec::from("abc")).len() * 8) as u64;
+        let mut default_hashes: Vec<Vec<u8>> = Vec::new();
+        default_hashes.push(_leaf_hash(&hash, &c, &EMPTY.to_vec(), &Vec::new()));
+        for i in 1..(n + 1) {
+            let prev_index = (i - 1) as usize;
+            default_hashes.push(hash(&cat(
+                default_hashes[prev_index].as_slice(),
+                default_hashes[prev_index].as_slice())));
+        }
+
+        return SMT {
+            c,
+            base: vec![0 as u8; (n / 8) as usize],
+            n,
+            default_hashes,
+            hash,
+        };
     }
 
-    fn default_hash(&self, height: u64) -> Vec<u8> {
-        return self.default_hashes[height as usize].clone();
+    pub fn audit_path<C: Cache>(&self, d: &D, key: &Vec<u8>, cache: &C) -> Vec<Vec<u8>> {
+        self.audit_path_internal(d, self.n, &self.base, key, cache)
     }
 
-    fn interior_hash(&self, left: &Vec<u8>, right: &Vec<u8>, height: u64, base: &Vec<u8>) -> Vec<u8> {
-        _interior_hash(&self.hash, left, right, height, base)
+    fn audit_path_internal<C: Cache>(&self, d: &D, height: u64, base: &Vec<u8>, key: &Vec<u8>, cache: &C) -> Vec<Vec<u8>> {
+        if height == 0 {
+            return Vec::new();
+        }
+        let split = bit_split(base, self.n - height);
+        let (l, r) = d.split(&split);
+
+        if !bit_is_set(key, self.n - height) {
+            let mut t = self.audit_path_internal(&l, height - 1, base, key, cache);
+            t.push(self.root_hash_internal(&r, height - 1, &split, cache));
+            return t;
+        }
+        let mut t = self.audit_path_internal(&r, height - 1, &split, key, cache);
+        t.push(self.root_hash_internal(&l, height - 1, base, cache));
+        return t;
     }
 
-    pub fn root_hash(&self, d: D, height: u64, base: &Vec<u8>) -> Vec<u8> {
-        if self.cache.exists(height, base) {
-            return self.cache.get(height, base);
+    fn audit_path_calc(&self, ap: &Vec<Vec<u8>>, height: u64, base: &Vec<u8>, key: &Vec<u8>, value: &Vec<u8>) -> Vec<u8> {
+        if height == 0 {
+            return self.leaf_hash(value, base);
+        }
+        let split = bit_split(base, self.n - height);
+        if !bit_is_set(key, self.n - height) {
+            return self.interior_hash(
+                &self.audit_path_calc(ap, height - 1, base, key, value),
+                &ap[height as usize - 1],
+                height,
+                base,
+            );
+        }
+
+        return self.interior_hash(
+            &ap[height as usize - 1],
+            &self.audit_path_calc(ap, height - 1, &split, key, value),
+            height,
+            base,
+        );
+    }
+
+    pub fn verify_audit_path(&self, ap: &Vec<Vec<u8>>, key: &Vec<u8>, value: &Vec<u8>, root: &Vec<u8>) -> bool {
+        return root.eq(&self.audit_path_calc(ap, self.n, &vec![0 as u8; (self.n / 8) as usize], key, value));
+    }
+
+    pub fn root_hash<C: Cache>(&self, d: &D, cache: &C) -> Vec<u8>{
+        self.root_hash_internal(d, self.n, &self.base, cache)
+    }
+
+    fn root_hash_internal<C: Cache>(&self, d: &D, height: u64, base: &Vec<u8>, cache: &C) -> Vec<u8> {
+        if cache.exists(height, base) {
+            return cache.get(height, base);
         }
         if d.d.len() == 0 {
             return self.default_hash(height);
@@ -101,11 +160,15 @@ impl<'a, C: Cache> SMT<'a, C> {
         let (l, r) = d.split(&split);
 
         return self.interior_hash(
-            &self.root_hash(l, height - 1, base),
-            &self.root_hash(r, height - 1, &split), height, base);
+            &self.root_hash_internal(&l, height - 1, base, cache),
+            &self.root_hash_internal(&r, height - 1, &split, cache), height, base);
     }
 
-    pub fn update(&mut self, d: D, key: Key, height: u64, base: &Vec<u8>, value: &Vec<u8>) -> Vec<u8> {
+    pub fn update<C: Cache>(&self, d: &D, key: Key, value: &Vec<u8>, cache: &mut C) -> Vec<u8> {
+        self.update_internal(d, key, self.n, &self.base, value, cache)
+    }
+
+    fn update_internal<C: Cache>(&self, d: &D, key: Key, height: u64, base: &Vec<u8>, value: &Vec<u8>, cache: &mut C) -> Vec<u8> {
         if height == 0 {
             return self.leaf_hash(value, base);
         }
@@ -115,48 +178,43 @@ impl<'a, C: Cache> SMT<'a, C> {
         let (l_keys, r_keys) = key.split(&split);
 
         if l_keys.keys.len() == 0 && r_keys.keys.len() > 0 {
-            return self.cache.hash_cache(
-                &self.hash,
-                &self.root_hash(l_d, height - 1, base),
-                &self.update(r_d, key, height - 1, &split, value),
-                height, base, &split, &_interior_hash, &self.default_hashes);
+            let left = &self.root_hash_internal(&l_d, height - 1, base, cache);
+            let right = &self.update_internal(&r_d, key, height - 1, &split, value, cache);
+            let ih = self.interior_hash(left, right, height, base);
+            cache.hash_cache(left, right, height, base, &split, &ih, &self.default_hashes);
+            return ih;
         }
         if l_keys.keys.len() > 0 && r_keys.keys.len() == 0 {
-            return self.cache.hash_cache(
-                &self.hash,
-                &self.update(l_d, key, height - 1, base, value),
-                &self.root_hash(r_d, height - 1, &split),
-                height, base, &split, &_interior_hash, &self.default_hashes);
-        }
-        return self.cache.hash_cache(
-            &self.hash,
-            &self.update(l_d, l_keys, height - 1, base, value),
-            &self.update(r_d, r_keys, height - 1, &split, value),
-            height, base, &split, &_interior_hash, &self.default_hashes);
-    }
-    pub fn new(c: Vec<u8>, cache: &'a mut C, hash: Box<fn(&Vec<u8>) -> Vec<u8>>) -> SMT<'a, C> {
-        let n = ((*hash)(&Vec::from("abc")).len() * 8) as u64;
-        let mut default_hashes: Vec<Vec<u8>> = Vec::new();
-        default_hashes.push(_leaf_hash(*hash, &c, &EMPTY.to_vec(), &Vec::new()));
-        for i in 1..(n + 1) {
-            let prev_index = (i - 1) as usize;
-            default_hashes.push(hash(&cat(
-                default_hashes[prev_index].as_slice(),
-                default_hashes[prev_index].as_slice())));
+            let left = &self.update_internal(&l_d, key, height - 1, base, value, cache);
+            let right = &self.root_hash_internal(&r_d, height - 1, &split, cache);
+            let ih = self.interior_hash(left, right, height, base);
+            cache.hash_cache(left, right, height, base, &split, &ih, &self.default_hashes);
+            return ih;
         }
 
-        return SMT {
-            c,
-            base: vec![0 as u8; (n / 8) as usize],
-            n,
-            default_hashes,
-            hash: *hash,
-            cache,
-        };
+        let left = &self.update_internal(&l_d, l_keys, height - 1, base, value, cache);
+        let right = &self.update_internal(&r_d, r_keys, height - 1, &split, value, cache);
+        let ih = self.interior_hash(left, right, height, base);
+        cache.hash_cache(left, right, height, base, &split, &ih, &self.default_hashes);
+
+        return ih;
+    }
+
+
+    fn leaf_hash(&self, a: &Vec<u8>, base: &Vec<u8>) -> Vec<u8> {
+        return _leaf_hash(&self.hash, &self.c, a, base);
+    }
+
+    fn default_hash(&self, height: u64) -> Vec<u8> {
+        return self.default_hashes[height as usize].clone();
+    }
+
+    fn interior_hash(&self, left: &Vec<u8>, right: &Vec<u8>, height: u64, base: &Vec<u8>) -> Vec<u8> {
+        _interior_hash(&self.hash, left, right, height, base)
     }
 }
 
-fn _interior_hash(hash: &Fn(&Vec<u8>) -> Vec<u8>, left: &Vec<u8>, right: &Vec<u8>, height: u64, base: &Vec<u8>) -> Vec<u8> {
+fn _interior_hash(hash: &Box<Fn(&Vec<u8>) -> Vec<u8>>, left: &Vec<u8>, right: &Vec<u8>, height: u64, base: &Vec<u8>) -> Vec<u8> {
     let lr = cat(left, right);
     if left == right {
         return hash(&lr);
@@ -169,7 +227,7 @@ fn _interior_hash(hash: &Fn(&Vec<u8>) -> Vec<u8>, left: &Vec<u8>, right: &Vec<u8
     return hash(&lr);
 }
 
-fn _leaf_hash(hash: fn(&Vec<u8>) -> Vec<u8>, c: &Vec<u8>, a: &Vec<u8>, base: &Vec<u8>) -> Vec<u8> {
+fn _leaf_hash(hash: &Box<Fn(&Vec<u8>) -> Vec<u8>>, c: &Vec<u8>, a: &Vec<u8>, base: &Vec<u8>) -> Vec<u8> {
     if *a == EMPTY {
         return hash(c);
     }

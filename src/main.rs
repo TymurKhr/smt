@@ -6,8 +6,8 @@ use rustc_serialize::hex::ToHex;
 use smt::cache::CacheBranch;
 use std::collections::HashMap;
 
-fn digest_adapter(algorithm: &'static digest::Algorithm) -> Box<Fn(&Vec<u8>)->Vec<u8>>{
-    let closure = move |x:&Vec<u8>|  digest::digest(algorithm, x.as_slice()).as_ref().to_vec();
+fn digest_adapter(algorithm: &'static digest::Algorithm) -> Box<Fn(&[u8])->Vec<u8>>{
+    let closure = move |x:&[u8]|  digest::digest(algorithm, x).as_ref().to_vec();
     return Box::new(closure);
 }
 
